@@ -10,7 +10,7 @@ from pydantic import BaseModel
 import json
 import logging
 import sys
-#push to docker
+#Push again to docker workflow
 # Set up advanced logging
 logging.basicConfig(
     level=logging.DEBUG,
