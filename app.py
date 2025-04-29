@@ -74,11 +74,26 @@ async def inpaint(
         # Add header bytes debug info
         if len(image_content) > 20:
             header_bytes = image_content[:20]
-            logger.info(f"Image header bytes: {' '.join(f'{b:02x}' for b in header_bytes)}")
+            header_hex = ' '.join(f'{b:02x}' for b in header_bytes)
+            logger.info(f"Image header bytes: {header_hex}")
+            
+            # Check for common image format signatures
+            if not (
+                header_hex.startswith('ff d8 ff') or  # JPEG
+                header_hex.startswith('89 50 4e 47') or  # PNG
+                header_hex.startswith('47 49 46 38') or  # GIF
+                header_hex.startswith('42 4d')  # BMP
+            ):
+                logger.warning(f"Header doesn't match common image formats: {header_hex}")
         
         try:
+            # Validate image before processing
+            buffer = io.BytesIO(image_content)
+            buffer.seek(0)  # Ensure we're at the start of the buffer
+            
             # Try to open the image
-            img = Image.open(io.BytesIO(image_content)).convert("RGB")
+            img = Image.open(buffer)
+            img = img.convert("RGB")  # Convert after successful open
             logger.info(f"Image opened successfully: {img.format}, size: {img.size}")
         except UnidentifiedImageError as img_err:
             logger.error(f"Unidentified image error: {str(img_err)}")
@@ -90,6 +105,7 @@ async def inpaint(
         # For testing, just return the same image
         buffered = io.BytesIO()
         img.save(buffered, format="JPEG")
+        buffered.seek(0)
         img_str = base64.b64encode(buffered.getvalue()).decode()
         
         return {"image": img_str}
@@ -127,6 +143,11 @@ async def predict(request: PredictRequest):
         logger.info(f"Base64 string length: {len(image_b64)} characters")
         
         try:
+            # Make sure the base64 string doesn't contain data URI prefix
+            if ',' in image_b64:
+                logger.info("Removing data URI prefix from base64 string")
+                image_b64 = image_b64.split(',', 1)[1]
+            
             # Decode the base64 image
             image_content = base64.b64decode(image_b64)
             logger.info(f"Decoded image size: {len(image_content)} bytes")
@@ -136,7 +157,9 @@ async def predict(request: PredictRequest):
                 header_bytes = image_content[:20]
                 logger.info(f"Image header bytes: {' '.join(f'{b:02x}' for b in header_bytes)}")
             
-            img = Image.open(io.BytesIO(image_content)).convert("RGB")
+            buffer = io.BytesIO(image_content)
+            buffer.seek(0)
+            img = Image.open(buffer).convert("RGB")
             logger.info(f"Image opened successfully: {img.format}, size: {img.size}")
         except Exception as e:
             logger.error(f"Image processing error: {str(e)}")
@@ -145,6 +168,7 @@ async def predict(request: PredictRequest):
         # For testing, just return the same image
         buffered = io.BytesIO()
         img.save(buffered, format="JPEG")
+        buffered.seek(0)
         img_str = base64.b64encode(buffered.getvalue()).decode()
         
         return {"data": [img_str]}
@@ -236,3 +260,5 @@ async def test_image():
 # This is not required but useful for direct testing
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+
+
