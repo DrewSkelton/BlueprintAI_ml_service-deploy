@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y \
 
 # Create cache directory with proper permissions
 RUN mkdir -p /app/.cache && chmod -R 777 /app/.cache
+RUN pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
 
 # Copy requirements first to leverage Docker cache
