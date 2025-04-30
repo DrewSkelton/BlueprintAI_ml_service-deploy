@@ -1,56 +1,82 @@
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Body
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageDraw
 import io
 import base64
 import uvicorn
+import torch
+from diffusers import DiffusionPipeline
 from contextlib import asynccontextmanager
-from pydantic import BaseModel
-import json
-import logging
-import sys
-#Push again to docker workflow
-# Set up advanced logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger(__name__)
+import os
 
-# For Hugging Face Spaces compatibility
-class PredictRequest(BaseModel):
-    data: list
+# Read environment variables with defaults for Docker
+CACHE_DIR = os.environ.get("HF_CACHE_DIR", "/app/.cache")
+MODEL_ID = os.environ.get("MODEL_ID", "stabilityai/stable-diffusion-2-inpainting")
+INFERENCE_STEPS = int(os.environ.get("INFERENCE_STEPS", "30"))
+GUIDANCE_SCALE = float(os.environ.get("GUIDANCE_SCALE", "7.5"))
+USE_LOCAL_FILES = os.environ.get("USE_LOCAL_FILES", "False").lower() == "true"
+
+# Set up cache directories for Hugging Face
+os.environ["HF_HOME"] = CACHE_DIR
+os.environ["TRANSFORMERS_CACHE"] = CACHE_DIR
+os.environ["DIFFUSERS_CACHE"] = CACHE_DIR
+
+# Ensure cache directory exists with proper permissions
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# Global variables for model
+model = None
 
 @asynccontextmanager
 async def lifespan(app):
-    logger.info("Starting up ML service")
+    print(f"Starting up ML service with model: {MODEL_ID}")
+    print(f"Cache directory: {CACHE_DIR}")
+    
+    # Load model during startup
+    global model
+    try:
+        model = DiffusionPipeline.from_pretrained(
+            MODEL_ID,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            use_safetensors=True,
+            local_files_only=USE_LOCAL_FILES,
+        )
+        # Move to GPU if available
+        if torch.cuda.is_available():
+            model = model.to("cuda")
+            print("ML model loaded on GPU")
+        else:
+            print("ML model loaded on CPU")
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        model = None
     yield
-    logger.info("Shutting down ML service")
+    print("Shutting down ML service")
+    # Clean up resources
+    if model:
+        del model
 
 app = FastAPI(lifespan=lifespan)
 
 # Add CORS middleware to allow cross-origin requests
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Allow all origins
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
 )
 
 @app.get("/")
 async def root():
     """Root endpoint that displays basic API information"""
-    logger.info("Root endpoint accessed")
     return {
         "message": "BlueprintAI Inpainting API",
         "endpoints": {
-            "POST /inpaint/": "Submit an image for inpainting with specified theme",
-            "POST /api/predict": "Hugging Face Spaces compatible endpoint"
+            "POST /inpaint/": "Submit an image for inpainting with specified theme"
         },
-        "status": "online"
+        "model": MODEL_ID,
+        "status": "online" if model is not None else "model loading failed"
     }
 
 @app.post("/inpaint/")
@@ -59,206 +85,61 @@ async def inpaint(
     theme_description: str = Form(...),
     theme_color: str = Form(...)
 ):
+    """Process an image with an inpainting model using a hardcoded mask."""
+    # Check if model is loaded
+    global model
+    if model is None:
+        raise HTTPException(status_code=503, detail="ML model not available")
+    
     try:
-        logger.info(f"Received inpaint request: {theme_description}, {theme_color}")
-        logger.info(f"Image filename: {image.filename}, content_type: {image.content_type}")
-        
         # Read image
         image_content = await image.read()
-        logger.info(f"Image content size: {len(image_content)} bytes")
+        img = Image.open(io.BytesIO(image_content)).convert("RGB")
         
-        if len(image_content) == 0:
-            logger.error("Empty image content received")
-            raise HTTPException(status_code=400, detail="Empty image file")
+        # Resize image to match model requirements (512x512 is typical for SD models)
+        original_size = img.size
+        img = img.resize((512, 512))
         
-        # Add header bytes debug info
-        if len(image_content) > 20:
-            header_bytes = image_content[:20]
-            header_hex = ' '.join(f'{b:02x}' for b in header_bytes)
-            logger.info(f"Image header bytes: {header_hex}")
-            
-            # Check for common image format signatures
-            if not (
-                header_hex.startswith('ff d8 ff') or  # JPEG
-                header_hex.startswith('89 50 4e 47') or  # PNG
-                header_hex.startswith('47 49 46 38') or  # GIF
-                header_hex.startswith('42 4d')  # BMP
-            ):
-                logger.warning(f"Header doesn't match common image formats: {header_hex}")
+        # Create a hardcoded mask (white is the area to inpaint, black is the area to keep)
+        mask = Image.new("RGB", (512, 512), "black")
+        mask_draw = ImageDraw.Draw(mask)
+        # Create a circular mask in the center
+        mask_draw.ellipse(
+            [(512 * 0.25, 512 * 0.25), (512 * 0.75, 512 * 0.75)],
+            fill="white"
+        )
+        mask = mask.convert("L")  # Convert to grayscale
         
-        try:
-            # Validate image before processing
-            buffer = io.BytesIO(image_content)
-            buffer.seek(0)  # Ensure we're at the start of the buffer
-            
-            # Try to open the image
-            img = Image.open(buffer)
-            img = img.convert("RGB")  # Convert after successful open
-            logger.info(f"Image opened successfully: {img.format}, size: {img.size}")
-        except UnidentifiedImageError as img_err:
-            logger.error(f"Unidentified image error: {str(img_err)}")
-            raise HTTPException(status_code=400, detail=f"Invalid image format: {str(img_err)}")
-        except Exception as e:
-            logger.error(f"Failed to open image: {str(e)}")
-            raise HTTPException(status_code=400, detail=f"Invalid image file: {str(e)}")
+        # Prepare prompt based on theme description and color
+        prompt = f"{theme_description} with {theme_color} color, high quality, detailed"
         
-        # For testing, just return the same image
+        # Run inference with configurable parameters
+        output = model(
+            prompt=prompt,
+            image=img,
+            mask_image=mask,
+            guidance_scale=GUIDANCE_SCALE,
+            num_inference_steps=INFERENCE_STEPS,
+        ).images[0]
+        
+        # Resize back to original dimensions if needed
+        if original_size != (512, 512):
+            output = output.resize(original_size)
+        
+        # Convert output to base64 encoded string
         buffered = io.BytesIO()
-        img.save(buffered, format="JPEG")
-        buffered.seek(0)
+        output.save(buffered, format="JPEG")
         img_str = base64.b64encode(buffered.getvalue()).decode()
         
-        return {"image": img_str}
-    except UnidentifiedImageError as img_err:
-        logger.error(f"Unidentified image error: {str(img_err)}")
-        raise HTTPException(status_code=400, detail=f"Invalid image file: {str(img_err)}")
-    except Exception as e:
-        logger.error(f"General error in inpaint: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
-
-# Add a simple test endpoint that doesn't require file uploads
-@app.post("/test")
-async def test(data: dict = Body(...)):
-    """Simple test endpoint that echoes the input data"""
-    logger.info(f"Test endpoint called with data: {data}")
-    return {"received": data, "success": True}
-
-# HF Spaces compatible endpoint with additional troubleshooting
-@app.post("/api/predict")
-async def predict(request: PredictRequest):
-    try:
-        logger.info(f"Received predict request, data length: {len(request.data)}")
-        
-        # Extract data from the Spaces format
-        if len(request.data) < 3:
-            logger.warning(f"Insufficient data: {len(request.data)} items")
-            return {"error": "Missing required data"}
-        
-        # Typically HF Spaces will send base64 encoded image and parameters
-        image_b64 = request.data[0]
-        theme_description = request.data[1]
-        theme_color = request.data[2]
-        
-        logger.info(f"Processing with theme: {theme_description}, color: {theme_color}")
-        logger.info(f"Base64 string length: {len(image_b64)} characters")
-        
-        try:
-            # Make sure the base64 string doesn't contain data URI prefix
-            if ',' in image_b64:
-                logger.info("Removing data URI prefix from base64 string")
-                image_b64 = image_b64.split(',', 1)[1]
-            
-            # Decode the base64 image
-            image_content = base64.b64decode(image_b64)
-            logger.info(f"Decoded image size: {len(image_content)} bytes")
-            
-            # Add header bytes debug info
-            if len(image_content) > 20:
-                header_bytes = image_content[:20]
-                logger.info(f"Image header bytes: {' '.join(f'{b:02x}' for b in header_bytes)}")
-            
-            buffer = io.BytesIO(image_content)
-            buffer.seek(0)
-            img = Image.open(buffer).convert("RGB")
-            logger.info(f"Image opened successfully: {img.format}, size: {img.size}")
-        except Exception as e:
-            logger.error(f"Image processing error: {str(e)}")
-            return {"error": f"Invalid image data: {str(e)}"}
-        
-        # For testing, just return the same image
-        buffered = io.BytesIO()
-        img.save(buffered, format="JPEG")
-        buffered.seek(0)
-        img_str = base64.b64encode(buffered.getvalue()).decode()
-        
-        return {"data": [img_str]}
-    except Exception as e:
-        logger.error(f"Error in predict endpoint: {str(e)}")
-        return {"error": f"Error processing request: {str(e)}"}
-
-# Catch-all route to help debug routing issues
-@app.api_route("/{path_name:path}", methods=["GET", "POST", "PUT", "DELETE"])
-async def catch_all(request: Request, path_name: str):
-    logger.info(f"Catch-all route accessed: {path_name}")
-    logger.info(f"Request method: {request.method}")
-    logger.info(f"Request headers: {dict(request.headers)}")
-    
-    # For GET requests, just return info
-    if request.method == "GET":
         return {
-            "message": "Route not found",
-            "requested_path": path_name,
-            "available_routes": [{"path": route.path, "methods": route.methods} for route in app.routes]
+            "image": img_str,
+            "prompt_used": prompt,
+            "mask_type": "circular center mask"
         }
-    
-    # For POST requests, try to read the body
-    if request.method == "POST":
-        try:
-            body = await request.body()
-            content_type = request.headers.get("content-type", "")
-            
-            if "application/json" in content_type:
-                try:
-                    json_body = await request.json()
-                    return {
-                        "message": "Route not found",
-                        "requested_path": path_name,
-                        "content_type": content_type,
-                        "json_body": json_body
-                    }
-                except:
-                    pass
-            
-            return {
-                "message": "Route not found",
-                "requested_path": path_name,
-                "content_type": content_type,
-                "body_size": len(body)
-            }
-        except Exception as e:
-            return {
-                "message": "Route not found",
-                "requested_path": path_name,
-                "error": str(e)
-            }
-
-# Add a specific debugging endpoint
-@app.get("/debug")
-async def debug(request: Request):
-    client_host = request.client.host if request.client else "unknown"
-    headers = dict(request.headers)
-    return {
-        "client": client_host,
-        "headers": headers,
-        "base_url": str(request.base_url),
-        "app_routes": [{"path": route.path, "methods": route.methods} for route in app.routes]
-    }
-
-# Simple test image endpoint that generates a test image
-@app.get("/test-image")
-async def test_image():
-    """Generate a test image to verify the API is working"""
-    # Create a simple test image (a gradient)
-    width, height = 300, 200
-    img = Image.new('RGB', (width, height))
-    
-    # Draw a simple gradient
-    for x in range(width):
-        for y in range(height):
-            r = int(255 * x / width)
-            g = int(255 * y / height)
-            b = 100
-            img.putpixel((x, y), (r, g, b))
-    
-    # Return the image as base64
-    buffered = io.BytesIO()
-    img.save(buffered, format="JPEG")
-    img_str = base64.b64encode(buffered.getvalue()).decode()
-    
-    return {"image": img_str}
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
 
 # This is not required but useful for direct testing
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
-
-

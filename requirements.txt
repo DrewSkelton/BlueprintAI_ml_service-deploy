@@ -4,3 +4,8 @@ diffusers
 torch
 Pillow
 python-multipart
+transformers
+accelerate
+safetensors
+scipy
+numpy

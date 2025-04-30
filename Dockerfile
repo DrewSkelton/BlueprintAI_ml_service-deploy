@@ -5,21 +5,25 @@ WORKDIR /app
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
-    curl \
-    software-properties-common \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements file
+# Create cache directory with proper permissions
+RUN mkdir -p /app/.cache && chmod -R 777 /app/.cache
+
+
+# Copy requirements first to leverage Docker cache
 COPY requirements.txt .
 
-# Install Python dependencies with specific versions
-RUN pip install --no-cache-dir uvicorn==0.23.2 fastapi==0.103.1 python-multipart Pillow
+# Install dependencies
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY app.py .
+# Copy the rest of the application
+COPY . .
 
-# Expose port
-EXPOSE 7860
+# Set environment variable for HF cache
+ENV HF_HOME=/app/.cache
+
+ENV DIFFUSERS_CACHE=/app/.cache
 
 # Run the application
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
