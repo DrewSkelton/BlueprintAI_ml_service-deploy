@@ -4,7 +4,7 @@ from PIL import Image
 import io
 
 # Test the root endpoint
-response = requests.get("http://localhost:8000/")
+response = requests.get("http://localhost:7860/")
 print("Root endpoint response:", response.json())
 
 # Test inpainting
@@ -13,7 +13,7 @@ with open(image_path, "rb") as img_file:
     files = {"image": img_file}
     data = {"theme_description": "forest landscape", "theme_color": "green"}
     
-    response = requests.post("http://localhost:8000/inpaint/", files=files, data=data)
+    response = requests.post("http://localhost:7860/inpaint/", files=files, data=data)
     
     if response.status_code == 200:
         # Decode and save the result
